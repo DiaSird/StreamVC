@@ -5,3 +5,4 @@ safetensors==0.4.3
 tensorboard==2.16.2
 einops==0.7.0
 accelerate==0.29.3
+tyro==0.8.11
