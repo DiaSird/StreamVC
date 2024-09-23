@@ -23,7 +23,7 @@ class DataShard(Dataset):
         audio_path = os.path.join(self.path, f"{id}.ogg")
         labels_path = os.path.join(self.path, f"{id}.npy")
         audio = torch.tensor(sf.read(audio_path)[0], dtype=torch.float32)
-        labels = torch.tensor(np.load(labels_path), dtype=torch.int8)
+        labels = torch.tensor(np.load(labels_path), dtype=torch.long)
         return audio, labels
 
 

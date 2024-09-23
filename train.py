@@ -1,5 +1,4 @@
 import os
-import time
 from itertools import islice
 from typing import Union
 
@@ -22,6 +21,7 @@ from streamvc.train.loss import (
     ReconstructionLoss,
 )
 import tyro
+import config.lr_scheduler as scheduler_config
 from config.training_config import ContentEncoderTrainingConfig, DecoderTrainingConfig
 from config.utils import get_flattened_config_dict
 from typing_extensions import Annotated
@@ -41,6 +41,22 @@ NUM_CLASSES = 100
 EMBEDDING_DIMS = 64
 SAMPLES_PER_FRAME = 320
 DEVICE = accelerator.device
+
+TrainingConfig = Union[
+    Annotated[
+        ContentEncoderTrainingConfig,
+        tyro.conf.subcommand(
+            "content-encoder", description="Train the Content Encoder module"
+        ),
+    ],
+    Annotated[
+        DecoderTrainingConfig,
+        tyro.conf.subcommand(
+            "decoder",
+            description="Train the Decoder and Traget Speaker modules, requires a trained Content Encoder",
+        ),
+    ],
+]
 
 
 def sizeof_fmt(num, suffix="B"):
@@ -84,58 +100,55 @@ def log_labels_tensorboard(outputs_flat, labels_flat, step):
     summary_writer.add_histogram("labels/hubert", labels_flat, global_step=step)
 
 
-def get_lr_Scheduler(optimizer, args, discriminator=False):
-    if args.scheduler == "StepLR":
+def get_lr_Scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: TrainingConfig,
+    total_steps: int,
+    discriminator: bool = False,
+):
+    scheduler = config.lr_scheduler
+    if scheduler is None:
+        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=1)
+    elif isinstance(scheduler, scheduler_config.StepLR):
         return torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=args.scheduler_step, gamma=args.scheduler_gamma
+            optimizer, step_size=scheduler.step, gamma=scheduler.gamma
         )
-    elif args.scheduler == "LinearLR":
+    elif isinstance(scheduler, scheduler_config.LinearLR):
         return torch.optim.lr_scheduler.LinearLR(
             optimizer,
-            start_factor=args.scheduler_linear_start,
-            end_factor=args.scheduler_linear_end,
-            total_iters=args.num_epochs * args.limit_num_batches,
+            start_factor=scheduler.start,
+            end_factor=scheduler.end,
+            total_iters=total_steps,
         )
-    elif args.scheduler == "ExponentialLR":
-        return torch.optim.lr_scheduler.ExponentialLR(
-            optimizer, gamma=args.scheduler_gamma
-        )
-    elif args.scheduler == "OneCycleLR":
-        max_lr = args.scheduler_onecycle_max
+    elif isinstance(scheduler, scheduler_config.ExponentialLR):
+        return torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=scheduler.gamma)
+    elif isinstance(scheduler, scheduler_config.OneCycleLR):
+        max_lr = scheduler.max
         if discriminator:
-            max_lr = args.lr_discriminator_multiplier * max_lr
+            assert isinstance(config, DecoderTrainingConfig)
+            max_lr = config.lr_discriminator_multiplier * max_lr
         return torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=max_lr,
-            steps_per_epoch=args.limit_num_batches,
-            epochs=args.num_epochs,
-            pct_start=args.scheduler_onecycle_pct_start,
-            div_factor=args.scheduler_onecycle_div_factor,
-            final_div_factor=args.scheduler_onecycle_final_div_factor,
+            total_steps=total_steps,
+            pct_start=scheduler.pct_start,
+            div_factor=scheduler.div_factor,
+            final_div_factor=scheduler.final_div_factor,
         )
-    elif args.scheduler == "CosineAnnealingWarmRestarts":
+    elif isinstance(scheduler, scheduler_config.CosineAnnealingWarmRestarts):
         return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
-            T_0=args.scheduler_step,
+            T_0=scheduler.T_0,
             T_mult=1,
-            eta_min=args.scheduler_cosine_eta_min,
+            eta_min=scheduler.eta_min,
         )
     else:
-        raise ValueError(f"Unknown scheduler: {args.scheduler}")
+        raise ValueError(f"Unknown scheduler: {config.scheduler}")
 
 
 def train_content_encoder(
     content_encoder: nn.Module, config: ContentEncoderTrainingConfig
 ) -> nn.Module:
-    """
-    Train a content encoder as a classifier to predict the same labels as a discrete hubert model.
-
-    :param content_encoder: A content encoder wrapped with a linear layer to
-    :param lr: Learning rate.
-    :param num_epochs: Number of epochs.
-    :return: The trained content encoder wrapped with a linear layer for classification.
-    """
-    # TODO: add epochs or number of steps when we know how much time it takes to train the model.
     wrapped_content_encoder = EncoderClassifier(
         content_encoder, EMBEDDING_DIMS, NUM_CLASSES, dropout=config.dropout
     ).train()
@@ -146,12 +159,17 @@ def train_content_encoder(
         betas=config.betas,
         weight_decay=config.weight_decay,
     )
-    scheduler = get_lr_Scheduler(optimizer, config)
 
     dataset = PreprocessedDataset(config.datasets.train_dataset_path)
     dataloader = dataset.get_dataloader(
         config.batch_size, limit_samples=config.limit_batch_samples
     )
+
+    total_steps = (
+        max([i for i in [len(dataloader), config.limit_num_batches] if i is not None])
+        * config.num_epochs
+    )
+    scheduler = get_lr_Scheduler(optimizer, config, total_steps)
 
     dev_dataset = PreprocessedDataset(config.datasets.dev_dataset_path)
     dev_dataloader = dev_dataset.get_dataloader(
@@ -227,7 +245,7 @@ def train_content_encoder(
                 accelerator.save_model(
                     wrapped_content_encoder,
                     save_directory=os.path.join(
-                        config.checkpoint_path,
+                        config.model_checkpoint_path,
                         f"{config.run_name}_content_encoder_{epoch}_{step}",
                     ),
                 )
@@ -267,13 +285,7 @@ def compute_content_encoder_accuracy(dataloader, wrapped_content_encoder: nn.Mod
     return 100 * correct / total
 
 
-def train_streamvc(streamvc_model: StreamVC, config: DecoderTrainingConfig) -> None:
-    """
-    Trains a StreamVC model.
-
-    :param streamvc_model: The model to train.
-    :param args: Hyperparameters for training.
-    """
+def train_decoder(streamvc_model: StreamVC, config: DecoderTrainingConfig) -> None:
     #######################
     # Load PyTorch Models #
     #######################
@@ -301,14 +313,15 @@ def train_streamvc(streamvc_model: StreamVC, config: DecoderTrainingConfig) -> N
         weight_decay=config.weight_decay,
     )
 
-    scheduler_generator = get_lr_Scheduler(optimizer_generator, config)
-    scheduler_discriminator = get_lr_Scheduler(
-        optimizer_discriminator, config, discriminator=True
-    )
-
     dataset = PreprocessedDataset(config.datasets.train_dataset_path)
     dataloader = dataset.get_dataloader(
         config.batch_size, limit_samples=config.limit_batch_samples
+    )
+
+    total_steps = max(len(dataloader), config.limit_num_batches) * config.num_epochs
+    scheduler_generator = get_lr_Scheduler(optimizer_generator, config, total_steps)
+    scheduler_discriminator = get_lr_Scheduler(
+        optimizer_discriminator, config, total_steps, discriminator=True
     )
 
     generator_loss_fn = GeneratorLoss()
@@ -472,23 +485,6 @@ def train_streamvc(streamvc_model: StreamVC, config: DecoderTrainingConfig) -> N
             global_step += 1
 
 
-TrainingConfig = Union[
-    Annotated[
-        ContentEncoderTrainingConfig,
-        tyro.conf.subcommand(
-            "content-encoder", description="Train the Content Encoder module"
-        ),
-    ],
-    Annotated[
-        DecoderTrainingConfig,
-        tyro.conf.subcommand(
-            "decoder",
-            description="Train the Decoder and Traget Speaker modules, requires a trained Content Encoder",
-        ),
-    ],
-]
-
-
 def main(config: TrainingConfig) -> None:
     """Main function for training StreamVC model."""
     logger.debug(f"DEVICE={accelerator.device}")
@@ -521,7 +517,7 @@ def main(config: TrainingConfig) -> None:
             if key.startswith("encoder.")
         }
         streamvc.content_encoder.load_state_dict(encoder_state_dict)
-        train_streamvc(streamvc, config)
+        train_decoder(streamvc, config)
 
     accelerator.end_training()
 
@@ -531,5 +527,6 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    logger.setLevel(logging.DEBUG)
     config = tyro.cli(TrainingConfig)
     main(config)
