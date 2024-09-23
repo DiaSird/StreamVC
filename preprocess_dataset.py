@@ -7,27 +7,30 @@ import numpy as np
 from einops import rearrange
 import tqdm as tqdm
 
-DATASET_HF = "blabble-io/libritts"
+DATASET_HF = "mythicinfinity/libritts"
 SAMPLE_RATE = 16000
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def get_libritts_dataset(split, streaming=True) -> (Dataset | IterableDataset):
-    dataset = load_dataset(DATASET_HF, "all",
-                           split=split, streaming=streaming)
-    dataset = dataset.cast_column('audio', Audio(sampling_rate=SAMPLE_RATE))
-    dataset = dataset.with_format('torch')
+def get_libritts_dataset(split, streaming=True) -> Dataset | IterableDataset:
+    dataset = load_dataset(DATASET_HF, "all", split=split, streaming=streaming)
+    dataset = dataset.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+    dataset = dataset.with_format("torch")
     return dataset
 
 
 class Hubert:
     def __init__(self):
-        self.model = torch.hub.load("bshall/hubert:main", "hubert_discrete",
-                                    trust_repo=True).eval()
+        self.model = (
+            torch.hub.load("bshall/hubert:main", "hubert_discrete", trust_repo=True)
+            .eval()
+            .to(DEVICE)
+        )
 
     @torch.no_grad()
     def get_labels(self, audio):
-        single_sample_batch = rearrange(audio, 's -> 1 1 s')
-        labels = self.model.units(single_sample_batch)
+        single_sample_batch = rearrange(audio, "s -> 1 1 s").to(DEVICE)
+        labels = self.model.units(single_sample_batch).to("cpu")
         return labels
 
 
@@ -57,18 +60,42 @@ def main(args):
         os.makedirs(shard_path, exist_ok=True)
 
         write_audio_and_labels(
-            id=sample['id'],
-            audio=sample['audio']['array'],
-            labels=hubert.get_labels(sample['audio']['array']),
-            save_path=shard_path
+            id=sample["id"],
+            audio=sample["audio"]["array"],
+            labels=hubert.get_labels(sample["audio"]["array"]),
+            save_path=shard_path,
         )
     pbar.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--split", type=str, default="train.clean.100")
-    parser.add_argument("--shard_length", type=int, default=5000)
-    parser.add_argument("--path", type=str, default="./dataset")
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train.clean.100",
+        choices=[
+            "train.clean.100",
+            "train.clean.360",
+            "train.other.500",
+            "dev.clean",
+            "dev.other",
+            "test.clean",
+            "test.other",
+        ],
+        help="The split of the LibriTTS dataset to preprocess",
+    )
+    parser.add_argument(
+        "--shard_length",
+        type=int,
+        default=5000,
+        help="The number of samples to include in each directory on disk",
+    )
+    parser.add_argument(
+        "--path",
+        type=str,
+        default="./dataset",
+        help="The path to save the preprocessed datasets",
+    )
     args = parser.parse_args()
     main(args)
