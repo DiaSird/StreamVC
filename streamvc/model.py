@@ -35,6 +35,8 @@ class StreamVC(nn.Module):
         target_latent = self.speech_pooling(self.speech_encoder(target_speech))
         return self.decoder(source_linguistic_features, target_latent)
 
+######### Streaming Inference Mode - Not Implemented #########
+
     @contextmanager
     def streaming(self, target_speech: torch.Tensor):
         gradient_checkpointing = False
