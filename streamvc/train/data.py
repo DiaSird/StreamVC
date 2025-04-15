@@ -28,15 +28,20 @@ class DataShard(Dataset):
 
 
 class PreprocessedDataset(Dataset):
-    def __init__(self, path):
-        self.path = path
+    def __init__(self, paths: str | Iterable[str]):
+        if isinstance(paths, str):
+            paths = [paths]
 
-        directories = sorted(
-            filter(
-                os.path.isdir,
-                (os.path.join(path, dirname) for dirname in os.listdir(path)),
+        directories = []
+        for path in paths:
+            directories.extend(
+                sorted(
+                    filter(
+                        os.path.isdir,
+                        (os.path.join(path, dirname) for dirname in os.listdir(path)),
+                    )
+                )
             )
-        )
         self.shards = [DataShard(shard_dir) for shard_dir in directories]
 
     def __len__(self):
@@ -72,7 +77,7 @@ class PreprocessedDataset(Dataset):
         assert torch.all(frame_mask == labels_mask)
         return audio_batch, labels_batch, audio_mask
 
-    def get_dataloader(self, batch_size, num_workers=0, limit_samples=None):
+    def get_dataloader(self, batch_size, num_workers=4, limit_samples=None):
         return DataLoader(
             self,
             batch_size=batch_size,

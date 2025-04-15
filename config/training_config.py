@@ -5,11 +5,11 @@ import tyro
 
 @dataclass(frozen=True)
 class DatasetsConfig:
-    train_dataset_path: str = "./dataset/train.clean.100"
+    train_dataset_path: str | list[str] = "./dataset/train.clean.100"
     """Path to the preprocessed training dataset"""
-    dev_dataset_path: str = "./dataset/dev.clean"
+    dev_dataset_path: str | list[str] = "./dataset/dev.clean"
     """Path to the preprocessed development dataset"""
-    test_dataset_path: str = "./dataset/test.clean"
+    test_dataset_path: str | list[str] = "./dataset/test.clean"
     """Path to the preprocessed test dataset"""
 
 
@@ -59,6 +59,9 @@ class TrainingBaseConfig:
     log_gradient_interval: int | None = None
     """Interval (in steps) at which to log gradient information. Use None to disable"""
 
+    restore_state_dir: str | None = None
+    """Path to restore model (+optimizer, scheduler etc.) state from. Use None to start from scratch"""
+
 
 @dataclass(frozen=True)
 class ContentEncoderTrainingConfig(TrainingBaseConfig):
@@ -69,6 +72,9 @@ class ContentEncoderTrainingConfig(TrainingBaseConfig):
 
     accuracy_interval: int = 100
     """Interval (in steps) at which to compute and log accuracy"""
+
+    accuracy_limit_num_batches: int | None = 20
+    """Limit the number of batches to compute accuracy. Use None for no limit"""
 
     log_labels_interval: int | None = None
     """Interval (in steps) at which to log label information. Use None to disable"""

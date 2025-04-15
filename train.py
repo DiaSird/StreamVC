@@ -1,11 +1,15 @@
+import abc
+from dataclasses import dataclass
 import os
 from itertools import islice
 from typing import Union
 
+import accelerate.checkpointing
 import safetensors as st
 import safetensors.torch
 import torch
 import torch.nn as nn
+import accelerate
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import ProjectConfiguration
 from accelerate.logging import get_logger
@@ -42,6 +46,8 @@ EMBEDDING_DIMS = 64
 SAMPLES_PER_FRAME = 320
 DEVICE = accelerator.device
 
+####### cli commands #######
+
 TrainingConfig = Union[
     Annotated[
         ContentEncoderTrainingConfig,
@@ -58,28 +64,7 @@ TrainingConfig = Union[
     ],
 ]
 
-
-def sizeof_fmt(num, suffix="B"):
-    for unit in ("", "K", "M", "G", "T", "P"):
-        if abs(num) < 1024.0:
-            return f"{num:.1f} {unit}{suffix}"
-        num /= 1024.0
-
-
-def print_cuda_memory(s):
-    if accelerator.device.type != "cuda":
-        logger.debug(s)
-        return
-    free, total = torch.cuda.mem_get_info()
-    curr = torch.cuda.memory_allocated()
-    peak = torch.cuda.max_memory_allocated()
-
-    size = {"allocated": curr, "total": total, "free": free, "peak": peak}
-
-    logger.debug(
-        " | ".join(map(lambda x: f"{x[0]} {sizeof_fmt(x[1]):8}", size.items()))
-        + f" - {s}"
-    )
+####### tensorboard logging functions #######
 
 
 @accelerator.on_main_process
@@ -98,6 +83,9 @@ def log_labels_tensorboard(outputs_flat, labels_flat, step):
     summary_writer = accelerator.get_tracker("tensorboard").tracker
     summary_writer.add_histogram("labels/content_encoder", predicted, global_step=step)
     summary_writer.add_histogram("labels/hubert", labels_flat, global_step=step)
+
+
+####### LR schedulers #######
 
 
 def get_lr_Scheduler(
@@ -146,368 +134,246 @@ def get_lr_Scheduler(
         raise ValueError(f"Unknown scheduler: {config.scheduler}")
 
 
-def train_content_encoder(
-    content_encoder: nn.Module, config: ContentEncoderTrainingConfig
-) -> nn.Module:
-    wrapped_content_encoder = EncoderClassifier(
-        content_encoder, EMBEDDING_DIMS, NUM_CLASSES, dropout=config.dropout
-    ).train()
-    criterion = nn.CrossEntropyLoss(ignore_index=-1)
-    optimizer = torch.optim.AdamW(
-        params=wrapped_content_encoder.parameters(),
-        lr=config.lr,
-        betas=config.betas,
-        weight_decay=config.weight_decay,
-    )
+####### Savable counter #######
 
-    dataset = PreprocessedDataset(config.datasets.train_dataset_path)
-    dataloader = dataset.get_dataloader(
-        config.batch_size, limit_samples=config.limit_batch_samples
-    )
 
-    total_steps = (
-        max([i for i in [len(dataloader), config.limit_num_batches] if i is not None])
-        * config.num_epochs
-    )
-    scheduler = get_lr_Scheduler(optimizer, config, total_steps)
+@dataclass
+class CounterState:
+    value: int = 0
 
-    dev_dataset = PreprocessedDataset(config.datasets.dev_dataset_path)
-    dev_dataloader = dev_dataset.get_dataloader(
-        config.batch_size, limit_samples=config.limit_batch_samples
-    )
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {"value": torch.tensor(self.value, dtype=torch.long, device="cpu")}
 
-    [
-        wrapped_content_encoder,
-        optimizer,
-        dataloader,
-        dev_dataloader,
-        criterion,
-        scheduler,
-    ] = accelerator.prepare(
-        wrapped_content_encoder,
-        optimizer,
-        dataloader,
-        dev_dataloader,
-        criterion,
-        scheduler,
-    )
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+        self.value = state_dict["value"].item()
 
-    costs = []
-    global_step = 0
-    for epoch in range(0, config.num_epochs):
-        logger.info(f"epoch num: {epoch}")
-        for step, (batch, labels, _) in enumerate(
-            islice(dataloader, config.limit_num_batches)
-        ):
-            with accelerator.accumulate(wrapped_content_encoder):
-                outputs = wrapped_content_encoder(batch)
-                outputs_flat = outputs.view(-1, NUM_CLASSES)
-                labels_flat = labels.view(-1)
-                loss = criterion(outputs_flat, labels_flat)
-                accelerator.backward(loss)
 
-                if (
-                    config.log_gradient_interval
-                    and (global_step + 1) % config.log_gradient_interval == 0
-                ):
-                    log_gradients_tensorboard(wrapped_content_encoder, global_step)
+####### Training #######
 
-                optimizer.step()
-                optimizer.zero_grad()
-                scheduler.step(global_step)
-                accelerator.log(
-                    {
-                        "loss/content_encoder": loss.item(),
-                        "lr/content_encoder": scheduler.get_last_lr()[0],
-                        "allocated_memory": torch.cuda.max_memory_allocated()
-                        if accelerator.device.type == "cuda"
-                        else 0,
-                    },
-                    step=global_step,
+
+class TrainerBase(abc.ABC):
+    def __init__(self, config: TrainingConfig):
+        self.config = config
+        config: TrainingConfig = self.config
+        self.train_dataset = PreprocessedDataset(config.datasets.train_dataset_path)
+        self.train_dataloader = self.train_dataset.get_dataloader(
+            config.batch_size, limit_samples=config.limit_batch_samples
+        )
+
+        self.steps_per_epoch = max(
+            [
+                i
+                for i in [len(self.train_dataloader), config.limit_num_batches]
+                if i is not None
+            ]
+        )
+        self.total_steps = self.steps_per_epoch * config.num_epochs
+
+        self.dev_dataset = PreprocessedDataset(config.datasets.dev_dataset_path)
+        self.dev_dataloader = self.dev_dataset.get_dataloader(
+            config.batch_size, limit_samples=config.limit_batch_samples
+        )
+        self.models = {}
+        self._prepered_training = False
+
+    @abc.abstractmethod
+    def prepare_training(self) -> None:
+        assert not self._prepered_training, "prepare_training can only be called once"
+        self._prepered_training = True
+
+    @abc.abstractmethod
+    def train_step(
+        self,
+        batch: torch.Tensor,
+        lables: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Annotated[float, "loss"]: ...
+
+    def save_state(self):
+        accelerator.wait_for_everyone()
+        accelerator.save_state(
+            os.path.join(
+                self.config.model_checkpoint_path, f"{self.config.run_name}_state"
+            )
+        )
+
+    def save_models(self):
+        for name, model in self.models.items():
+            accelerator.save_model(
+                model,
+                save_directory=os.path.join(
+                    self.config.model_checkpoint_path,
+                    f"{self.config.run_name}_{name}",
+                ),
+            )
+
+    def train(self) -> None:
+        config = self.config
+        if not self._prepered_training:
+            self.prepare_training()
+
+        if not hasattr(self, "global_step"):
+            self.global_step = CounterState()
+            accelerator.register_for_checkpointing(self.global_step)
+        else:
+            self.global_step.value = 0
+
+        if config.restore_state_dir is not None:
+            accelerator.load_state(config.restore_state_dir)
+
+        start_epoch = self.global_step.value // self.steps_per_epoch
+        start_step = self.global_step.value % self.steps_per_epoch
+
+        losses_aggregate = []
+        for epoch in range(start_epoch, config.num_epochs):
+            logger.info(f"epoch num: {epoch}")
+
+            dataloader = self.train_dataloader
+            if start_step != 0:
+                dataloader = accelerator.skip_first_batches(
+                    self.train_dataloader, start_step
                 )
-                costs.append(loss.item())
 
-            # print loss
-            if (global_step + 1) % config.print_interval == 0:
-                logger.info(
-                    f"[{epoch}, {step:5}] loss: {torch.tensor(costs).mean().item():.4}"
-                )
-                costs = []
-
-            if (
-                config.log_labels_interval
-                and (global_step + 1) % config.log_labels_interval == 0
+            for step, (batch, labels, mask) in enumerate(
+                islice(dataloader, config.limit_num_batches),
+                start=start_step,
             ):
-                log_labels_tensorboard(outputs_flat, labels_flat, global_step)
+                loss = self.train_step(batch, labels, mask)
 
-            # save model checkpoints
-            if (global_step + 1) % config.model_checkpoint_interval == 0:
-                accelerator.save_model(
-                    wrapped_content_encoder,
-                    save_directory=os.path.join(
-                        config.model_checkpoint_path,
-                        f"{config.run_name}_content_encoder_{epoch}_{step}",
-                    ),
-                )
+                losses_aggregate.append(loss)
+                if (self.global_step.value + 1) % config.print_interval == 0:
+                    logger.info(
+                        f"[{epoch}, {step:5}] loss: {torch.tensor(losses_aggregate).mean().item():.4}"
+                    )
+                    losses_aggregate = []
 
-            if (global_step + 1) % config.accuracy_interval == 0:
-                accuracy = compute_content_encoder_accuracy(
-                    islice(dev_dataloader, 10), wrapped_content_encoder
-                )
-                accuracies = accelerator.gather_for_metrics([accuracy])
-                accuracies = torch.tensor(accuracies)
-                gathered_accuracy = accuracies.mean().item()
-                accelerator.log(
-                    {"accuracy/content_encoder": gathered_accuracy}, step=global_step
-                )
-                logger.info(f"accuracy: {accuracy:.2f}%")
-            if accelerator.device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats()
+                if (self.global_step.value + 1) % config.model_checkpoint_interval == 0:
+                    self.save_state()
 
-            global_step += 1
+                self.after_train_step()
+                self.global_step.value += 1
+                start_step = 0
+
+        self.save_state()
+        self.save_models()
+
+    def after_train_step(self) -> None:
+        pass
 
 
-@torch.no_grad()
-def compute_content_encoder_accuracy(dataloader, wrapped_content_encoder: nn.Module):
-    correct = 0
-    total = 0
-    wrapped_content_encoder.to(accelerator.device).eval()
-    for batch, labels, _ in dataloader:
-        batch = batch.to(accelerator.device)
-        outputs = wrapped_content_encoder(batch)
+class ContentEncoderTrainer(TrainerBase):
+    def __init__(self, config: ContentEncoderTrainingConfig):
+        super().__init__(config)
+        streamvc = StreamVC(gradient_checkpointing=config.gradient_checkpointing)
+        content_encoder = streamvc.content_encoder
+        wrapped_content_encoder = EncoderClassifier(
+            content_encoder, EMBEDDING_DIMS, NUM_CLASSES, dropout=config.dropout
+        )
+        self.content_encoder = wrapped_content_encoder
+        self.models["content_encoder"] = wrapped_content_encoder
+
+    def prepare_training(self) -> None:
+        super().prepare_training()
+        self.content_encoder.train()
+        criterion = nn.CrossEntropyLoss(ignore_index=-1)
+        optimizer = torch.optim.AdamW(
+            params=self.content_encoder.parameters(),
+            lr=self.config.lr,
+            betas=self.config.betas,
+            weight_decay=self.config.weight_decay,
+        )
+
+        scheduler = get_lr_Scheduler(optimizer, self.config, self.total_steps)
+
+        [
+            self.content_encoder,
+            self.optimizer,
+            self.train_dataloader,
+            self.dev_dataloader,
+            self.criterion,
+            self.scheduler,
+        ] = accelerator.prepare(
+            self.content_encoder,
+            optimizer,
+            self.train_dataloader,
+            self.dev_dataloader,
+            criterion,
+            scheduler,
+        )
+
+    def train_step(
+        self,
+        batch: torch.Tensor,
+        labels: torch.Tensor,
+        _,
+    ) -> Annotated[float, "loss"]:
+        outputs = self.content_encoder(batch)
         outputs_flat = outputs.view(-1, NUM_CLASSES)
         labels_flat = labels.view(-1)
-        _, predicted = torch.max(outputs_flat.data, 1)
-        total += torch.sum(labels_flat != -1).item()
-        correct += (predicted == labels_flat).sum().item()
-    wrapped_content_encoder.train()
+        loss = self.criterion(outputs_flat, labels_flat)
+        accelerator.backward(loss)
 
-    return 100 * correct / total
-
-
-def train_decoder(streamvc_model: StreamVC, config: DecoderTrainingConfig) -> None:
-    #######################
-    # Load PyTorch Models #
-    #######################
-    generator = streamvc_model
-    discriminator = Discriminator(gradient_checkpointing=config.gradient_checkpointing)
-
-    for param in generator.content_encoder.parameters():
-        param.requires_grad = False
-
-    #####################
-    # Create optimizers #
-    #####################
-    optimizer_generator = torch.optim.AdamW(
-        params=[param for param in generator.parameters() if param.requires_grad],
-        lr=config.lr,
-        betas=config.betas,
-        weight_decay=config.weight_decay,
-    )
-
-    lr_discriminator = config.lr_discriminator_multiplier * config.lr
-    optimizer_discriminator = torch.optim.AdamW(
-        params=discriminator.parameters(),
-        lr=lr_discriminator,
-        betas=config.betas,
-        weight_decay=config.weight_decay,
-    )
-
-    dataset = PreprocessedDataset(config.datasets.train_dataset_path)
-    dataloader = dataset.get_dataloader(
-        config.batch_size, limit_samples=config.limit_batch_samples
-    )
-
-    total_steps = max(len(dataloader), config.limit_num_batches) * config.num_epochs
-    scheduler_generator = get_lr_Scheduler(optimizer_generator, config, total_steps)
-    scheduler_discriminator = get_lr_Scheduler(
-        optimizer_discriminator, config, total_steps, discriminator=True
-    )
-
-    generator_loss_fn = GeneratorLoss()
-    discriminator_loss_fn = DiscriminatorLoss()
-    feature_loss_fn = FeatureLoss()
-    reconstruction_loss_fn = ReconstructionLoss(
-        gradient_checkpointing=config.gradient_checkpointing
-    )
-
-    [
-        generator,
-        discriminator,
-        optimizer_generator,
-        optimizer_discriminator,
-        scheduler_generator,
-        scheduler_discriminator,
-        dataloader,
-        generator_loss_fn,
-        discriminator_loss_fn,
-        feature_loss_fn,
-        reconstruction_loss_fn,
-    ] = accelerator.prepare(
-        generator,
-        discriminator,
-        optimizer_generator,
-        optimizer_discriminator,
-        scheduler_generator,
-        scheduler_discriminator,
-        dataloader,
-        generator_loss_fn,
-        discriminator_loss_fn,
-        feature_loss_fn,
-        reconstruction_loss_fn,
-    )
-
-    costs = []
-    global_step = 0
-    for epoch in range(0, config.num_epochs):
-        logger.info(f"epoch num: {epoch}")
-        for step, (batch, _, mask) in enumerate(
-            islice(dataloader, config.limit_num_batches)
+        if (
+            self.config.log_gradient_interval
+            and (self.global_step.value + 1) % self.config.log_gradient_interval == 0
         ):
-            x_pred_t = generator(batch, batch)
-            # Remove the first 2 frames from the generated audio
-            # because we match a output frame t with input frame t-2.
-            x_pred_t = x_pred_t[..., SAMPLES_PER_FRAME * 2 :]
-            batch = batch[..., : x_pred_t.shape[-1]]
+            log_gradients_tensorboard(self.content_encoder, self.global_step.value)
 
-            mask_ratio = mask.sum(dim=-1) / mask.shape[-1]
-
-            #######################
-            # Train Discriminator #
-            #######################
-
-            discriminator.zero_grad()
-
-            discriminator_fake_detached = discriminator(x_pred_t.detach())
-            discriminator_real = discriminator(batch)
-
-            discriminator_loss = discriminator_loss_fn(
-                discriminator_real, discriminator_fake_detached, mask_ratio
-            )
-
-            accelerator.backward(discriminator_loss)
-
-            if (
-                config.log_gradient_interval
-                and (global_step + 1) % config.log_gradient_interval == 0
-            ):
-                log_gradients_tensorboard(discriminator, global_step)
-
-            optimizer_discriminator.step()
-            scheduler_discriminator.step(global_step)
-
-            ###################
-            # Train Generator #
-            ###################
-
-            generator.zero_grad()
-
-            discriminator_fake = discriminator(x_pred_t)
-
-            # Compute adversarial loss.
-            adversarial_loss = generator_loss_fn(discriminator_fake, mask_ratio)
-
-            # Compute feature loss.
-            feature_loss = feature_loss_fn(
-                discriminator_real, discriminator_fake, mask_ratio
-            )
-
-            # Compute reconstruction loss.
-            reconstruction_loss = reconstruction_loss_fn(batch, x_pred_t, mask_ratio)
-
-            losses = (
-                config.lambda_adversarial * adversarial_loss
-                + config.lambda_feature * feature_loss
-                + config.lambda_reconstruction * reconstruction_loss
-            )
-
-            accelerator.backward(losses)
-
-            if (
-                config.log_gradient_interval
-                and (global_step + 1) % config.log_gradient_interval == 0
-            ):
-                log_gradients_tensorboard(generator, global_step)
-
-            optimizer_generator.step()
-            scheduler_generator.step(global_step)
-
-            ######################
-            # Update tensorboard #
-            ######################
-            costs.append(
-                [
-                    discriminator_loss.item(),
-                    adversarial_loss.item(),
-                    feature_loss.item(),
-                    reconstruction_loss.item(),
-                ]
-            )
-
-            accelerator.log(
-                {
-                    "loss/discriminator": discriminator_loss.item(),
-                    "loss/adversarial": adversarial_loss.item(),
-                    "loss/feature_matching": feature_loss.item(),
-                    "loss/reconstruction": reconstruction_loss.item(),
-                    "lr/generator": scheduler_generator.get_last_lr()[0],
-                    "lr/discriminator": scheduler_discriminator.get_last_lr()[0],
-                    "allocated_memory": torch.cuda.max_memory_allocated()
-                    if accelerator.device.type == "cuda"
-                    else 0,
-                },
-                step=global_step,
-            )
-
-            if (global_step + 1) % config.print_interval == 0:
-                logger.info(
-                    f"[{epoch}, {step:5}] loss: {torch.tensor(costs).mean().item():.4}"
-                )
-                costs = []
-            if (global_step + 1) % config.model_checkpoint_interval == 0:
-                accelerator.save_model(
-                    generator,
-                    save_directory=os.path.join(
-                        config.model_checkpoint_path,
-                        f"{config.run_name}_generator_{epoch}_{step}",
-                    ),
-                )
-                accelerator.save_model(
-                    discriminator,
-                    save_directory=os.path.join(
-                        config.model_checkpoint_path,
-                        f"{config.run_name}_discriminator_{epoch}_{step}",
-                    ),
-                )
-            if accelerator.device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats()
-
-            global_step += 1
-
-
-def main(config: TrainingConfig) -> None:
-    """Main function for training StreamVC model."""
-    logger.debug(f"DEVICE={accelerator.device}")
-    hps = get_flattened_config_dict(config)
-    hps["num processes"] = accelerator.num_processes
-    hps["mixed precision"] = accelerator.mixed_precision
-    hps["gradient accumulation steps"] = accelerator.gradient_accumulation_steps
-
-    if accelerator.gradient_accumulation_steps > 1 and isinstance(
-        config, DecoderTrainingConfig
-    ):
-        raise ValueError(
-            "Gradient accumulation is not supported for the decoder training. Disable gradient accumulation from accelerate"
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.scheduler.step(self.global_step.value)
+        accelerator.log(
+            {
+                "loss/content_encoder": loss.item(),
+                "lr/content_encoder": self.scheduler.get_last_lr()[0],
+            },
+            step=self.global_step.value,
         )
-    logger.debug(f"{hps=}")
 
-    accelerator.init_trackers(config.run_name, config=hps)
-    streamvc = StreamVC(gradient_checkpointing=config.gradient_checkpointing)
+        if (
+            self.config.log_labels_interval
+            and (self.global_step.value + 1) % self.config.log_labels_interval == 0
+        ):
+            log_labels_tensorboard(outputs_flat, labels_flat, self.global_step.value)
 
-    if isinstance(config, ContentEncoderTrainingConfig):
-        content_encoder = streamvc.content_encoder
-        train_content_encoder(content_encoder, config)
-    else:
+        return loss.item()
+
+    def after_train_step(self) -> None:
+        if (self.global_step.value + 1) % self.config.accuracy_interval == 0:
+            accuracy = self.compute_content_encoder_accuracy()
+            accuracies = accelerator.gather_for_metrics([accuracy])
+            accuracies = torch.tensor(accuracies)
+            gathered_accuracy = accuracies.mean().item()
+            accelerator.log(
+                {"accuracy/content_encoder": gathered_accuracy},
+                step=self.global_step.value,
+            )
+            logger.info(f"accuracy: {accuracy:.2f}%")
+
+    @torch.no_grad()
+    def compute_content_encoder_accuracy(self):
+        correct = 0
+        total = 0
+        self.content_encoder.eval()
+        for batch, labels, _ in islice(
+            self.dev_dataloader, self.config.accuracy_limit_num_batches
+        ):
+            batch = batch.to(accelerator.device)
+            outputs = self.content_encoder(batch)
+            outputs_flat = outputs.view(-1, NUM_CLASSES)
+            labels_flat = labels.view(-1)
+            _, predicted = torch.max(outputs_flat.data, 1)
+            total += torch.sum(labels_flat != -1).item()
+            correct += (predicted == labels_flat).sum().item()
+        self.content_encoder.train()
+
+        return 100 * correct / total
+
+
+class DecoderTrainer(TrainerBase):
+    def __init__(self, config: DecoderTrainingConfig):
+        super().__init__(config)
+        streamvc = StreamVC(gradient_checkpointing=config.gradient_checkpointing)
         wrapped_encoder_state_dict = st.torch.load_file(
             config.content_encoder_checkpoint
         )
@@ -517,7 +383,178 @@ def main(config: TrainingConfig) -> None:
             if key.startswith("encoder.")
         }
         streamvc.content_encoder.load_state_dict(encoder_state_dict)
-        train_decoder(streamvc, config)
+
+        self.generator = streamvc
+        self.discriminator = Discriminator(
+            gradient_checkpointing=config.gradient_checkpointing
+        )
+        self.models["generator"] = self.generator
+        self.models["discriminator"] = self.discriminator
+
+    def prepare_training(self) -> None:
+        super().prepare_training()
+        config = self.config
+        for param in self.generator.content_encoder.parameters():
+            param.requires_grad = False
+
+        optimizer_generator = torch.optim.AdamW(
+            params=[
+                param for param in self.generator.parameters() if param.requires_grad
+            ],
+            lr=config.lr,
+            betas=config.betas,
+            weight_decay=config.weight_decay,
+        )
+
+        lr_discriminator = config.lr_discriminator_multiplier * config.lr
+        optimizer_discriminator = torch.optim.AdamW(
+            params=self.discriminator.parameters(),
+            lr=lr_discriminator,
+            betas=config.betas,
+            weight_decay=config.weight_decay,
+        )
+
+        scheduler_generator = get_lr_Scheduler(
+            optimizer_generator, config, self.total_steps
+        )
+        scheduler_discriminator = get_lr_Scheduler(
+            optimizer_discriminator, config, self.total_steps, discriminator=True
+        )
+
+        generator_loss_fn = GeneratorLoss()
+        discriminator_loss_fn = DiscriminatorLoss()
+        feature_loss_fn = FeatureLoss()
+        reconstruction_loss_fn = ReconstructionLoss(
+            gradient_checkpointing=config.gradient_checkpointing
+        )
+
+        [
+            self.generator,
+            self.discriminator,
+            self.optimizer_generator,
+            self.optimizer_discriminator,
+            self.scheduler_generator,
+            self.scheduler_discriminator,
+            self.train_dataloader,
+            self.generator_loss_fn,
+            self.discriminator_loss_fn,
+            self.feature_loss_fn,
+            self.reconstruction_loss_fn,
+        ] = accelerator.prepare(
+            self.generator,
+            self.discriminator,
+            optimizer_generator,
+            optimizer_discriminator,
+            scheduler_generator,
+            scheduler_discriminator,
+            self.train_dataloader,
+            generator_loss_fn,
+            discriminator_loss_fn,
+            feature_loss_fn,
+            reconstruction_loss_fn,
+        )
+
+    def train_step(
+        self,
+        batch: torch.Tensor,
+        _,
+        mask: torch.Tensor,
+    ) -> Annotated[float, "loss"]:
+        config = self.config
+        x_pred_t = self.generator(batch, batch)
+        # Remove the first 2 frames from the generated audio
+        # because we match a output frame t with input frame t-2.
+        x_pred_t = x_pred_t[..., SAMPLES_PER_FRAME * 2 :]
+        batch = batch[..., : x_pred_t.shape[-1]]
+
+        mask_ratio = mask.sum(dim=-1) / mask.shape[-1]
+
+        # Train Discriminator #
+        self.discriminator.zero_grad()
+
+        discriminator_fake_detached = self.discriminator(x_pred_t.detach())
+        discriminator_real = self.discriminator(batch)
+
+        discriminator_loss = self.discriminator_loss_fn(
+            discriminator_real, discriminator_fake_detached, mask_ratio
+        )
+
+        accelerator.backward(discriminator_loss)
+
+        if (
+            config.log_gradient_interval
+            and (self.global_step.value + 1) % config.log_gradient_interval == 0
+        ):
+            log_gradients_tensorboard(self.discriminator, self.global_step.value)
+
+        self.optimizer_discriminator.step()
+        self.scheduler_discriminator.step(self.global_step.value)
+
+        # Train Generator #
+
+        self.generator.zero_grad()
+
+        discriminator_fake = self.discriminator(x_pred_t)
+
+        adversarial_loss = self.generator_loss_fn(discriminator_fake, mask_ratio)
+        feature_loss = self.feature_loss_fn(
+            discriminator_real, discriminator_fake, mask_ratio
+        )
+        reconstruction_loss = self.reconstruction_loss_fn(batch, x_pred_t, mask_ratio)
+
+        losses = (
+            config.lambda_adversarial * adversarial_loss
+            + config.lambda_feature * feature_loss
+            + config.lambda_reconstruction * reconstruction_loss
+        )
+
+        accelerator.backward(losses)
+
+        if (
+            config.log_gradient_interval
+            and (self.global_step.value + 1) % config.log_gradient_interval == 0
+        ):
+            log_gradients_tensorboard(self.generator, self.global_step.value)
+
+        self.optimizer_generator.step()
+        self.scheduler_generator.step(self.global_step.value)
+
+        accelerator.log(
+            {
+                "loss/discriminator": discriminator_loss.item(),
+                "loss/adversarial": adversarial_loss.item(),
+                "loss/feature_matching": feature_loss.item(),
+                "loss/reconstruction": reconstruction_loss.item(),
+                "lr/generator": self.scheduler_generator.get_last_lr()[0],
+                "lr/discriminator": self.scheduler_discriminator.get_last_lr()[0],
+            },
+            step=self.global_step.value,
+        )
+
+        return reconstruction_loss.item()
+
+
+def main(config: TrainingConfig) -> None:
+    """Main function for training StreamVC model."""
+    logger.debug(f"DEVICE={accelerator.device}")
+    hps = get_flattened_config_dict(config)
+    hps["num processes"] = accelerator.num_processes
+    hps["mixed precision"] = accelerator.mixed_precision
+
+    if accelerator.gradient_accumulation_steps > 1:
+        raise ValueError(
+            "Gradient accumulation is not supported. Disable gradient accumulation from accelerate"
+        )
+    logger.debug(f"{hps=}")
+
+    accelerator.init_trackers(config.run_name, config=hps)
+
+    if isinstance(config, ContentEncoderTrainingConfig):
+        trainer = ContentEncoderTrainer(config)
+    else:
+        trainer = DecoderTrainer(config)
+
+    trainer.train()
 
     accelerator.end_training()
 
@@ -528,5 +565,5 @@ if __name__ == "__main__":
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     logger.setLevel(logging.DEBUG)
-    config = tyro.cli(TrainingConfig)
-    main(config)
+    training_config = tyro.cli(TrainingConfig)
+    main(training_config)

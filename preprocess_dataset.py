@@ -2,6 +2,7 @@ import argparse
 import os
 from datasets import load_dataset, Dataset, IterableDataset, Audio
 import torch
+from torch.utils.data import DataLoader
 import soundfile as sf
 import numpy as np
 from einops import rearrange
@@ -45,9 +46,10 @@ def main(args):
     save_path = os.path.join(args.path, args.split)
     os.makedirs(save_path, exist_ok=True)
     dataset = get_libritts_dataset(args.split)
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=4)
     hubert = Hubert()
     pbar = None
-    for i, sample in enumerate(dataset):
+    for i, sample in enumerate(dataloader):
         if i % args.shard_length == 0:
             if pbar:
                 pbar.close()
@@ -60,9 +62,9 @@ def main(args):
         os.makedirs(shard_path, exist_ok=True)
 
         write_audio_and_labels(
-            id=sample["id"],
-            audio=sample["audio"]["array"],
-            labels=hubert.get_labels(sample["audio"]["array"]),
+            id=sample["id"][0],
+            audio=sample["audio"]["array"][0],
+            labels=hubert.get_labels(sample["audio"]["array"][0]),
             save_path=shard_path,
         )
     pbar.close()
