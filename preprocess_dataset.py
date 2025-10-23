@@ -1,21 +1,36 @@
 import argparse
 import os
-from datasets import load_dataset, Dataset, IterableDataset, Audio
+from datasets import load_dataset, Audio
 import torch
-from torch.utils.data import DataLoader
 import soundfile as sf
 import numpy as np
 from einops import rearrange
-import tqdm as tqdm
+import tqdm
+
 
 DATASET_HF = "mythicinfinity/libritts"
 SAMPLE_RATE = 16000
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def get_libritts_dataset(split, streaming=True) -> Dataset | IterableDataset:
+def get_libritts_dataset(split, streaming=False):
     dataset = load_dataset(DATASET_HF, "all", split=split, streaming=streaming)
-    dataset = dataset.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+    dataset = dataset.cast_column(
+        "audio", Audio(decode=True, sampling_rate=SAMPLE_RATE)
+    )
+
+    def transform(example):
+        # example["audio"]: dict {"array": np.ndarray, "sampling_rate": int}
+        audio = example["audio"]
+        if isinstance(audio, list):
+            audio = audio[0]
+        if isinstance(audio, dict) and "array" in audio:
+            example["audio"] = audio["array"]
+        else:
+            example["audio"] = audio
+        return example
+
+    dataset = dataset.with_transform(transform)
     dataset = dataset.with_format("torch")
     return dataset
 
@@ -30,6 +45,9 @@ class Hubert:
 
     @torch.no_grad()
     def get_labels(self, audio):
+        if isinstance(audio, np.ndarray):
+            audio = torch.from_numpy(audio).float()
+
         single_sample_batch = rearrange(audio, "s -> 1 1 s").to(DEVICE)
         labels = self.model.units(single_sample_batch).to("cpu")
         return labels
@@ -38,36 +56,44 @@ class Hubert:
 def write_audio_and_labels(id, audio, labels, save_path):
     audio_path = os.path.join(save_path, f"{id}.ogg")
     labels_path = os.path.join(save_path, f"{id}.npy")
-    sf.write(audio_path, audio.detach().cpu().numpy(), SAMPLE_RATE)
+
+    sf.write(
+        audio_path,
+        audio.detach().cpu().numpy() if torch.is_tensor(audio) else audio,
+        SAMPLE_RATE,
+    )
     np.save(labels_path, labels.detach().cpu().numpy().astype(np.uint8))
 
 
 def main(args):
     save_path = os.path.join(args.path, args.split)
     os.makedirs(save_path, exist_ok=True)
-    dataset = get_libritts_dataset(args.split)
-    dataloader = DataLoader(dataset, batch_size=1, num_workers=4)
+    dataset = get_libritts_dataset(args.split, streaming=False)
     hubert = Hubert()
+
     pbar = None
-    for i, sample in enumerate(dataloader):
+
+    for i, sample in enumerate(dataset):
         if i % args.shard_length == 0:
             if pbar:
                 pbar.close()
             print(f"Processing shard {i // args.shard_length}")
             pbar = tqdm.tqdm(total=args.shard_length)
-        pbar.update(1)
+        pbar.update(1) # type: ignore
 
         shard_number = i // args.shard_length
         shard_path = os.path.join(save_path, f"shard_{shard_number}")
         os.makedirs(shard_path, exist_ok=True)
 
+        audio_array = sample["audio"]["array"]
+
         write_audio_and_labels(
-            id=sample["id"][0],
-            audio=sample["audio"]["array"][0],
-            labels=hubert.get_labels(sample["audio"]["array"][0]),
+            id=sample["id"],
+            audio=audio_array,
+            labels=hubert.get_labels(audio_array),
             save_path=shard_path,
         )
-    pbar.close()
+    pbar.close() # type: ignore
 
 
 if __name__ == "__main__":

@@ -18,7 +18,9 @@ def WNConv1d(*args, **kwargs):
 
 
 class NLayerDiscriminator(nn.Module):
-    def __init__(self, ndf, n_layers, downsampling_factor, gradient_checkpointing: bool = False):
+    def __init__(
+        self, ndf, n_layers, downsampling_factor, gradient_checkpointing: bool = False
+    ):
         super().__init__()
         model = nn.ModuleDict()
 
@@ -67,6 +69,7 @@ class NLayerDiscriminator(nn.Module):
                 x = layer(x)
                 results.append(x)
             return results
+
         return custom_forward
 
     def forward(self, x: torch.Tensor):
@@ -77,17 +80,27 @@ class NLayerDiscriminator(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, n_blocks=3, n_features=16, n_layers=4, downsampling_factor=4,
-                 gradient_checkpointing: bool = False):
+    def __init__(
+        self,
+        n_blocks=3,
+        n_features=16,
+        n_layers=4,
+        downsampling_factor=4,
+        gradient_checkpointing: bool = False,
+    ):
         super().__init__()
         self.model = nn.ModuleList()
         for i in range(n_blocks):
-            self.model.append(NLayerDiscriminator(
-                n_features, n_layers, downsampling_factor, gradient_checkpointing=gradient_checkpointing
-            ))
+            self.model.append(
+                NLayerDiscriminator(
+                    n_features,
+                    n_layers,
+                    downsampling_factor,
+                    gradient_checkpointing=gradient_checkpointing,
+                )
+            )
 
-        self.downsample = nn.AvgPool1d(
-            4, stride=2, padding=1, count_include_pad=False)
+        self.downsample = nn.AvgPool1d(4, stride=2, padding=1, count_include_pad=False)
         self.apply(weights_init)
 
     def forward(self, x):

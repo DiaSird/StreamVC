@@ -197,17 +197,19 @@ class TrainerBase(abc.ABC):
             )
         )
 
-    def save_models(self):
+    def save_models(self, best: bool = False):
+        prefix = "best_" if best else ""
         for name, model in self.models.items():
             accelerator.save_model(
                 model,
                 save_directory=os.path.join(
                     self.config.model_checkpoint_path,
-                    f"{self.config.run_name}_{name}",
+                    f"{prefix}{self.config.run_name}_{name}",
                 ),
             )
 
     def train(self) -> None:
+        # Config -> Prepere training
         config = self.config
         if not self._prepered_training:
             self.prepare_training()
@@ -223,7 +225,8 @@ class TrainerBase(abc.ABC):
 
         start_epoch = self.global_step.value // self.steps_per_epoch
         start_step = self.global_step.value % self.steps_per_epoch
-
+        
+        # Start traning
         losses_aggregate = []
         for epoch in range(start_epoch, config.num_epochs):
             logger.info(f"epoch num: {epoch}")
@@ -233,7 +236,8 @@ class TrainerBase(abc.ABC):
                 dataloader = accelerator.skip_first_batches(
                     self.train_dataloader, start_step
                 )
-
+            
+            # Train every step
             for step, (batch, labels, mask) in enumerate(
                 islice(dataloader, config.limit_num_batches),
                 start=start_step,
@@ -243,7 +247,7 @@ class TrainerBase(abc.ABC):
                 losses_aggregate.append(loss)
                 if (self.global_step.value + 1) % config.print_interval == 0:
                     logger.info(
-                        f"[{epoch}, {step:5}] loss: {torch.tensor(losses_aggregate).mean().item():.4}"
+                        f"[Epoch {epoch}, Step {step}/{self.steps_per_epoch}] loss: {torch.tensor(losses_aggregate).mean().item():.4}"
                     )
                     losses_aggregate = []
 
@@ -264,6 +268,8 @@ class TrainerBase(abc.ABC):
 class ContentEncoderTrainer(TrainerBase):
     def __init__(self, config: ContentEncoderTrainingConfig):
         super().__init__(config)
+
+        # StreamVC Encoder
         streamvc = StreamVC(gradient_checkpointing=config.gradient_checkpointing)
         content_encoder = streamvc.content_encoder
         wrapped_content_encoder = EncoderClassifier(
@@ -271,9 +277,12 @@ class ContentEncoderTrainer(TrainerBase):
         )
         self.content_encoder = wrapped_content_encoder
         self.models["content_encoder"] = wrapped_content_encoder
+        self.best_accuracy = 0.0
 
     def prepare_training(self) -> None:
         super().prepare_training()
+        
+        # Loss and Optimizer
         self.content_encoder.train()
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
         optimizer = torch.optim.AdamW(
@@ -349,6 +358,12 @@ class ContentEncoderTrainer(TrainerBase):
                 step=self.global_step.value,
             )
             logger.info(f"accuracy: {accuracy:.2f}%")
+            
+            # Best model
+            if gathered_accuracy > self.best_accuracy:
+                self.best_accuracy = gathered_accuracy
+                logger.info(f"New best accuracy: {gathered_accuracy:.2f}% — saving model.")
+                self.save_models(best=True)
 
     @torch.no_grad()
     def compute_content_encoder_accuracy(self):

@@ -1,8 +1,8 @@
-torch==2.2.2
-torchaudio==2.2.2
-datasets[audio]==2.18.0
-safetensors==0.4.3
-tensorboard==2.16.2
-einops==0.7.0
-accelerate==0.29.3
-tyro==0.8.11
+torch
+torchaudio
+datasets[audio]
+safetensors
+tensorboard
+einops
+accelerate
+tyro
