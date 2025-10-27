@@ -1,8 +1,8 @@
 SHELL=/bin/bash
 
 # Checkpoints
-ENC_CKPT="./checkpoints/best_svc_111_content_encoder/model.safetensors"
 # ENC_CKPT="./checkpoints/svc_111_state/model.safetensors"
+ENC_CKPT="./checkpoints/best_svc_111_content_encoder/model.safetensors"
 
 CKPT=checkpoints/svc_112_state/model.safetensors
 
@@ -61,9 +61,9 @@ dec:
 		--run-name svc_112 \
 		--batch_size 4 \
 		--num-epochs 5 \
-		--lr 1e-5 \
+		--lr 1e-4 \
 		--restore-state-dir ./checkpoints/svc_112_state \
-		--lambda_feature 50 --lambda_reconstruction 1 --lambda_adversarial 0.5 \
+		--lambda_feature 30 --lambda_reconstruction 1 --lambda_adversarial 0.5 \
 		--datasets.train-dataset-path ${DATASETS} \
 		--model-checkpoint-interval 500 \
 		--log-gradient-interval 500 \

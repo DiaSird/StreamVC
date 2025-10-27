@@ -66,9 +66,11 @@ class PreprocessedDataset(Dataset):
         )
         labels_batch, labels_mask = trunc_pad_concat_tensors(
             labels,
-            max_len=limit_samples // SAMPLES_PER_FRAME
-            if limit_samples is not None
-            else None,
+            max_len=(
+                limit_samples // SAMPLES_PER_FRAME
+                if limit_samples is not None
+                else None
+            ),
             pad_value=-1,
         )
         frame_mask = audio_mask.unfold(

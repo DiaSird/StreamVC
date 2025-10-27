@@ -10,22 +10,29 @@ class LearnablePooling(nn.Module):
     def __init__(self, embedding_dim: int):
         super().__init__()
         self.to_weights = nn.Sequential(
-            EinMix('b f e -> b f', weight_shape='e', e=embedding_dim),
-            nn.Softmax(dim=-1)
+            EinMix("b f e -> b f", weight_shape="e", e=embedding_dim),
+            nn.Softmax(dim=-1),
         )
 
-    @auto_batching(('* f e',), '* e')
+    @auto_batching(("* f e",), "* e")
     def forward(self, x: torch.Tensor):
         weights = self.to_weights(x)
-        return torch.einsum('b f e, b f -> b e', x, weights)
+        return torch.einsum("b f e, b f -> b e", x, weights)
 
 
 class CausalConv1d(nn.Conv1d):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
-                 stride: int = 1, dilation: int = 1,
-                 padding_mode: str = 'zeros', **kwargs):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        dilation: int = 1,
+        padding_mode: str = "zeros",
+        **kwargs
+    ):
 
-        assert 'padding' not in kwargs
+        assert "padding" not in kwargs
 
         super().__init__(
             in_channels=in_channels,
@@ -41,20 +48,16 @@ class CausalConv1d(nn.Conv1d):
         self.stride = stride
         self.dilation = dilation
 
-        self.causal_padding = max(
-            0, dilation * (kernel_size - 1) - (stride - 1))
+        self.causal_padding = max(0, dilation * (kernel_size - 1) - (stride - 1))
         self.padding_mode = padding_mode
 
-        self.register_buffer('streaming_buffer',
-                             torch.tensor([]), persistent=False)
+        self.register_buffer("streaming_buffer", torch.tensor([]), persistent=False)
         self.streaming_mode = False
 
     def _pad(self, x):
-        if self.padding_mode == 'zeros':
-            return F.pad(x, pad=(self.causal_padding, 0),
-                         mode='constant', value=0)
-        return F.pad(x, pad=(self.causal_padding, 0),
-                     mode=self.padding_mode)
+        if self.padding_mode == "zeros":
+            return F.pad(x, pad=(self.causal_padding, 0), mode="constant", value=0)
+        return F.pad(x, pad=(self.causal_padding, 0), mode=self.padding_mode)
 
     def forward(self, x):
         if self.streaming_mode:
@@ -64,11 +67,15 @@ class CausalConv1d(nn.Conv1d):
 
     def init_streaming_buffer(self):
         self.streaming_buffer = torch.zeros(
-            self.in_channels, self.causal_padding, device=next(iter(self.params())).device)
+            self.in_channels,
+            self.causal_padding,
+            device=next(iter(self.params())).device,
+        )
 
     def remove_streaming_buffer(self):
         self.streaming_buffer = torch.tensor(
-            [], device=next(iter(self.params())).device)
+            [], device=next(iter(self.params())).device
+        )
 
     def streaming_forward(self, x):
         if self.streaming_buffer.numel() == 0:
@@ -79,8 +86,9 @@ class CausalConv1d(nn.Conv1d):
         num_samples = full_input.shape[-1]
         kernel_reception_field = self.dilation * (self.kernel_size - 1) + 1
         num_strides = (num_samples - kernel_reception_field) // self.stride + 1
-        num_elements_for_forward = kernel_reception_field + \
-            (num_strides - 1) * self.stride
+        num_elements_for_forward = (
+            kernel_reception_field + (num_strides - 1) * self.stride
+        )
         ready_input = full_input[..., :num_elements_for_forward]
         new_buffer_size = num_samples - num_strides * self.stride
         self.streaming_buffer = full_input[..., -new_buffer_size:]
@@ -88,11 +96,18 @@ class CausalConv1d(nn.Conv1d):
 
 
 class CausalConvTranspose1d(nn.ConvTranspose1d):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
-                 stride: int = 1, dilation=1, **kwargs):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        dilation=1,
+        **kwargs
+    ):
 
-        assert 'padding' not in kwargs
-        assert 'output_padding' not in kwargs
+        assert "padding" not in kwargs
+        assert "output_padding" not in kwargs
 
         super().__init__(
             in_channels=in_channels,

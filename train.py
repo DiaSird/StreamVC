@@ -225,7 +225,7 @@ class TrainerBase(abc.ABC):
 
         start_epoch = self.global_step.value // self.steps_per_epoch
         start_step = self.global_step.value % self.steps_per_epoch
-        
+
         # Start traning
         losses_aggregate = []
         for epoch in range(start_epoch, config.num_epochs):
@@ -236,7 +236,7 @@ class TrainerBase(abc.ABC):
                 dataloader = accelerator.skip_first_batches(
                     self.train_dataloader, start_step
                 )
-            
+
             # Train every step
             for step, (batch, labels, mask) in enumerate(
                 islice(dataloader, config.limit_num_batches),
@@ -262,7 +262,13 @@ class TrainerBase(abc.ABC):
         self.save_models()
 
     def after_train_step(self) -> None:
-        pass
+        current_reconstruction_loss = self.train_step_loss
+        if current_reconstruction_loss < self.best_reconstruction_loss:
+            self.best_reconstruction_loss = current_reconstruction_loss
+            logger.info(
+                f"New best reconstruction loss: {current_reconstruction_loss:.4f} — saving model."
+            )
+            self.save_models(best=True)
 
 
 class ContentEncoderTrainer(TrainerBase):
@@ -281,7 +287,7 @@ class ContentEncoderTrainer(TrainerBase):
 
     def prepare_training(self) -> None:
         super().prepare_training()
-        
+
         # Loss and Optimizer
         self.content_encoder.train()
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
@@ -358,11 +364,13 @@ class ContentEncoderTrainer(TrainerBase):
                 step=self.global_step.value,
             )
             logger.info(f"accuracy: {accuracy:.2f}%")
-            
+
             # Best model
             if gathered_accuracy > self.best_accuracy:
                 self.best_accuracy = gathered_accuracy
-                logger.info(f"New best accuracy: {gathered_accuracy:.2f}% — saving model.")
+                logger.info(
+                    f"New best accuracy: {gathered_accuracy:.2f}% — saving model."
+                )
                 self.save_models(best=True)
 
     @torch.no_grad()
@@ -388,7 +396,11 @@ class ContentEncoderTrainer(TrainerBase):
 class DecoderTrainer(TrainerBase):
     def __init__(self, config: DecoderTrainingConfig):
         super().__init__(config)
+
+        # StreamVC Model
         streamvc = StreamVC(gradient_checkpointing=config.gradient_checkpointing)
+
+        # Encder loading
         wrapped_encoder_state_dict = st.torch.load_file(
             config.content_encoder_checkpoint
         )
@@ -397,6 +409,7 @@ class DecoderTrainer(TrainerBase):
             for key, value in wrapped_encoder_state_dict.items()
             if key.startswith("encoder.")
         }
+        # Assign content-encoder weights
         streamvc.content_encoder.load_state_dict(encoder_state_dict)
 
         self.generator = streamvc
@@ -405,6 +418,7 @@ class DecoderTrainer(TrainerBase):
         )
         self.models["generator"] = self.generator
         self.models["discriminator"] = self.discriminator
+        self.best_reconstruction_loss = float("inf")
 
     def prepare_training(self) -> None:
         super().prepare_training()
@@ -429,6 +443,7 @@ class DecoderTrainer(TrainerBase):
             weight_decay=config.weight_decay,
         )
 
+        # LR Schedulers
         scheduler_generator = get_lr_Scheduler(
             optimizer_generator, config, self.total_steps
         )
@@ -436,6 +451,7 @@ class DecoderTrainer(TrainerBase):
             optimizer_discriminator, config, self.total_steps, discriminator=True
         )
 
+        # Loss functions
         generator_loss_fn = GeneratorLoss()
         discriminator_loss_fn = DiscriminatorLoss()
         feature_loss_fn = FeatureLoss()

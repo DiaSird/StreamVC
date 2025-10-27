@@ -1,6 +1,8 @@
 # StreamVC
 An unofficial pytorch implementation of [STREAMVC: REAL-TIME LOW-LATENCY VOICE CONVERSION](https://arxiv.org/pdf/2401.03078.pdf) created for learning purposes.
 
+AI Summary: [Deepwiki StreamVC](https://deepwiki.com/yuval-reshef/StreamVC)
+
 This is not an official product, and while the code should work, I don't have a trained model checkpoint to share.
 If you successfully trained the model, I encourage you to share it on Hugging Face, and ping me so I can link it here.
 

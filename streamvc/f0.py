@@ -12,7 +12,7 @@ def estimate(
     frame_stride: int,
     pitch_max: float = 20000,
     thresholds: Iterable[float] = (0.05, 0.1, 0.15),
-    whitening: bool = True
+    whitening: bool = True,
 ) -> torch.Tensor:
     """Estimates the pitch (fundamental frequency) of a signal.
 
@@ -54,8 +54,7 @@ def estimate(
             # Normalize each row by subtracting mean and dividing by std
             mean = f0_estimation.mean(dim=-1, keepdim=True)
             std = f0_estimation.std(dim=-1, keepdim=True)
-            std_safe = torch.where(
-                std > 0, std, torch.tensor(1e-8).to(std.device))
+            std_safe = torch.where(std > 0, std, torch.tensor(1e-8).to(std.device))
             f0_estimation = (f0_estimation - mean) / std_safe
 
         outputs.append(f0_estimation)
@@ -79,8 +78,7 @@ def estimate(
 def _frame(signal: torch.Tensor, frame_length: int, frame_stride: int) -> torch.Tensor:
     # window the signal into overlapping frames, padding to at least 1 frame
     if signal.shape[-1] < frame_length:
-        signal = torch.nn.functional.pad(
-            signal, [0, frame_length - signal.shape[-1]])
+        signal = torch.nn.functional.pad(signal, [0, frame_length - signal.shape[-1]])
     return signal.unfold(dimension=-1, size=frame_length, step=frame_stride)
 
 
@@ -112,31 +110,72 @@ def _search(cmdf: torch.Tensor, tau_max: int, threshold: float) -> torch.Tensor:
     # if none are below threshold (argmax=0), this is a non-periodic frame
     first_below = (cmdf < threshold).int().argmax(-1, keepdim=True)
     first_below = torch.where(first_below > 0, first_below, tau_max)
-    beyond_threshold = torch.arange(
-        cmdf.shape[-1], device=cmdf.device) >= first_below
+    beyond_threshold = torch.arange(cmdf.shape[-1], device=cmdf.device) >= first_below
 
     # mask all periods with upward sloping cmdf to find the local minimum
-    increasing_slope = torch.nn.functional.pad(
-        cmdf.diff() >= 0.0, [0, 1], value=1)
+    increasing_slope = torch.nn.functional.pad(cmdf.diff() >= 0.0, [0, 1], value=1)
 
     # find the first period satisfying both constraints
     return (beyond_threshold & increasing_slope).int().argmax(-1)
 
 
 class F0Estimator(nn.Module):
-    def __init__(self, sample_rate: int = 16_000, frame_length_ms: int = 20,
-                 yin_thresholds: Iterable[float] = (0.05, 0.1, 0.15), whitening: bool = True):
+    def __init__(
+        self,
+        sample_rate: int = 16_000,
+        frame_length_ms: int = 20,
+        yin_thresholds: Iterable[float] = (0.05, 0.1, 0.15),
+        whitening: bool = True,
+    ):
         super().__init__()
         self.sample_rate = sample_rate
-        self.samples_per_frame = int(
-            self.sample_rate // (1 / frame_length_ms * 1000))
+        self.samples_per_frame = int(self.sample_rate // (1 / frame_length_ms * 1000))
         self.yin_thresholds = yin_thresholds
         self.whitening = whitening
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.pad(x, (self.samples_per_frame,
-                  self.samples_per_frame), "constant", 0)
-        f0 = estimate(x, self.sample_rate, frame_length=self.samples_per_frame * 3, frame_stride=self.samples_per_frame,
-                      thresholds=self.yin_thresholds, whitening=self.whitening,
-                      )
+        x = F.pad(x, (self.samples_per_frame, self.samples_per_frame), "constant", 0)
+        f0 = estimate(
+            x,
+            self.sample_rate,
+            frame_length=self.samples_per_frame * 3,
+            frame_stride=self.samples_per_frame,
+            thresholds=self.yin_thresholds,
+            whitening=self.whitening,
+        )
         return f0
+
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    # sin signal
+    sample_rate = 16000  # Hz
+    duration = 0.1  # 100ms
+    f0_true = 440  # Hz
+
+    t = torch.arange(0, int(sample_rate * duration)) / sample_rate
+    signal = torch.sin(2 * np.pi * f0_true * t)
+
+    # F0 Estimator
+    estimator = F0Estimator(sample_rate=sample_rate, whitening=False)
+
+    with torch.no_grad():
+        f0_output = estimator(signal)
+
+    print("Out Shape:", f0_output.shape)
+
+    n_thresholds = 3
+    f0_est = f0_output[..., 0::3]  # f0_estimation
+    voiced = f0_output[..., 1::3]  # unvoiced_predicate
+    cmd_val = f0_output[..., 2::3]  # cmdf_at_tau
+
+    print("F0 (Norm):", f0_est[0, :10])
+    print("Voiced flag:", voiced[0, :10])
+
+    # Graph F0
+    plt.figure(figsize=(8, 4))
+    plt.plot(f0_est[0].numpy(), label="F0_est")
+    plt.xlabel("Frame index")
+    plt.legend()
+    plt.savefig("f0.png")
